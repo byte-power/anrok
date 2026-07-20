@@ -7,6 +7,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -71,7 +72,7 @@ func main() {
 
 	ephemeral, err := client.CreateEphemeralTransaction(ephemeralReq)
 	if err != nil {
-		log.Fatalf("CreateEphemeralTransaction: %v", err)
+		handleError("CreateEphemeralTransaction", err)
 	}
 	printJSON("CreateEphemeralTransaction 响应摘要", map[string]any{
 		"taxAmountToCollect": ephemeral.TaxAmountToCollect,
@@ -95,7 +96,7 @@ func main() {
 
 	saved, err := client.CreateOrUpdateTransaction(createReq)
 	if err != nil {
-		log.Fatalf("CreateOrUpdateTransaction: %v", err)
+		handleError("CreateOrUpdateTransaction", err)
 	}
 	printJSON("CreateOrUpdateTransaction 响应摘要", map[string]any{
 		"version":            saved.Version,
@@ -104,6 +105,34 @@ func main() {
 		"transactionId":      txID,
 		"raw":                saved,
 	})
+}
+
+func handleError(op string, err error) {
+	var rateLimitErr *anrok.RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		log.Fatalf("%s: rate limited, retry after %d seconds", op, rateLimitErr.RetryAfter)
+	}
+
+	var typedErr *anrok.TypedError
+	if errors.As(err, &typedErr) {
+		switch {
+		case typedErr.IsType(anrok.ErrTaxDateTooFarInFuture):
+			log.Fatalf("%s: tax date is too far in the future", op)
+		case typedErr.IsType(anrok.ErrCustomerAddressCouldNotResolve):
+			log.Fatalf("%s: customer address could not be resolved, please check address fields", op)
+		case typedErr.IsType(anrok.ErrProductExternalIdUnknown):
+			log.Fatalf("%s: unknown product ID, please add it in Anrok first", op)
+		default:
+			log.Fatalf("%s: API error %s (HTTP %d)", op, typedErr.Type, typedErr.StatusCode)
+		}
+	}
+
+	var apiErr *anrok.APIError
+	if errors.As(err, &apiErr) {
+		log.Fatalf("%s: HTTP %d: %s", op, apiErr.StatusCode, apiErr.Body)
+	}
+
+	log.Fatalf("%s: %v", op, err)
 }
 
 func printJSON(title string, v any) {
