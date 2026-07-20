@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -69,14 +70,14 @@ func NewClientWithBaseURL(apiKey, baseURL string, httpClient *http.Client, logge
 	}
 }
 
-func (c *Client) doRequest(path string, requestBody any, response any) *Error {
+func (c *Client) doRequest(path string, requestBody any, response any) error {
 	url := c.baseURL + path
 
 	var bodyReader io.Reader
 	if requestBody != nil {
 		bodyBytes, err := json.Marshal(requestBody)
 		if err != nil {
-			return WrapError(err, "failed to marshal request body")
+			return &RequestError{Op: "marshal request", Err: err}
 		}
 		bodyReader = bytes.NewReader(bodyBytes)
 		c.logger.Debug("anrok_request",
@@ -86,7 +87,7 @@ func (c *Client) doRequest(path string, requestBody any, response any) *Error {
 
 	req, err := http.NewRequest(http.MethodPost, url, bodyReader)
 	if err != nil {
-		return WrapError(err, "failed to create request")
+		return &RequestError{Op: "create request", Err: err}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -98,7 +99,7 @@ func (c *Client) doRequest(path string, requestBody any, response any) *Error {
 		c.logger.Error("anrok_request_error",
 			String("url", url),
 			ErrorField(err))
-		return WrapError(err, "request failed")
+		return &RequestError{Op: "send request", Err: err}
 	}
 	defer resp.Body.Close()
 
@@ -107,7 +108,7 @@ func (c *Client) doRequest(path string, requestBody any, response any) *Error {
 		c.logger.Error("anrok_read_response_error",
 			String("url", url),
 			ErrorField(err))
-		return WrapError(err, "failed to read response")
+		return &RequestError{Op: "read response", Err: err}
 	}
 
 	c.logger.Debug("anrok_response",
@@ -116,20 +117,38 @@ func (c *Client) doRequest(path string, requestBody any, response any) *Error {
 		String("body", string(respBody)))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return WrapErrorf(nil, "HTTP %d: %s", resp.StatusCode, string(respBody))
+		return c.buildAPIError(resp, string(respBody))
 	}
 
 	if response != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, response); err != nil {
-			return WrapError(err, "failed to unmarshal response")
+			return &RequestError{Op: "unmarshal response", Err: err}
 		}
 	}
 
 	return nil
 }
 
+func (c *Client) buildAPIError(resp *http.Response, body string) error {
+	base := APIError{StatusCode: resp.StatusCode, Body: body}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		retryAfter, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
+		return &RateLimitError{APIError: base, RetryAfter: retryAfter}
+	}
+
+	var typed struct {
+		Type ErrorType `json:"type"`
+	}
+	if json.Unmarshal([]byte(body), &typed) == nil && typed.Type != "" {
+		return &TypedError{APIError: base, Type: typed.Type}
+	}
+
+	return &base
+}
+
 // CreateOrUpdateTransaction 根据发票明细计算销售税并在 Anrok 中保存交易（用于报税与阈值监控）
-func (c *Client) CreateOrUpdateTransaction(req CreateOrUpdateTransactionRequest) (*CreateOrUpdateTransactionResponse, *Error) {
+func (c *Client) CreateOrUpdateTransaction(req CreateOrUpdateTransactionRequest) (*CreateOrUpdateTransactionResponse, error) {
 	var out CreateOrUpdateTransactionResponse
 	if err := c.doRequest("/v1/seller/transactions/createOrUpdate", req, &out); err != nil {
 		return nil, err
@@ -138,7 +157,7 @@ func (c *Client) CreateOrUpdateTransaction(req CreateOrUpdateTransactionRequest)
 }
 
 // CreateEphemeralTransaction 计算销售税但不写入 Anrok（草稿/预览场景）
-func (c *Client) CreateEphemeralTransaction(req CreateEphemeralTransactionRequest) (*CreateEphemeralTransactionResponse, *Error) {
+func (c *Client) CreateEphemeralTransaction(req CreateEphemeralTransactionRequest) (*CreateEphemeralTransactionResponse, error) {
 	var out CreateEphemeralTransactionResponse
 	if err := c.doRequest("/v1/seller/transactions/createEphemeral", req, &out); err != nil {
 		return nil, err
